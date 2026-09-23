@@ -1,4 +1,5 @@
 import json
+import os
 import time
 import uuid
 from datetime import datetime, timezone
@@ -16,6 +17,12 @@ booking_lock = Lock()
 
 fault_enabled = False
 create_request_number = 0
+cardinality_lock = Lock()
+cardinality_request_ids = set()
+
+CARDINALITY_MODE = os.getenv("CARDINALITY_MODE", "safe").lower()
+if CARDINALITY_MODE not in {"safe", "unsafe"}:
+    raise RuntimeError("CARDINALITY_MODE must be 'safe' or 'unsafe'")
 
 
 # Application metrics
@@ -50,6 +57,21 @@ VALIDATION_DURATION = Summary(
     "Time spent validating booking requests",
 )
 
+# This deliberately changes shape between experiment modes. In unsafe mode,
+# every request ID creates a new time series. In safe mode, all requests share
+# one series. The experiment client is capped at 100 IDs.
+if CARDINALITY_MODE == "unsafe":
+    CARDINALITY_DEMO = Counter(
+        "demo_requests_total",
+        "Requests used by the bounded cardinality experiment",
+        ["request_id"],
+    )
+else:
+    CARDINALITY_DEMO = Counter(
+        "demo_requests_total",
+        "Requests used by the bounded cardinality experiment",
+    )
+
 
 class BookingRequest(BaseModel):
     room: str = Field(min_length=1, max_length=30)
@@ -64,7 +86,8 @@ def write_log(
 ):
     event = {
         "@timestamp": datetime.now(timezone.utc).isoformat(),
-        "service": "room-booking-api",
+        "service": {"name": "room-booking-api"},
+        "log": {"level": severity.lower()},
         "severity": severity,
         "message": message,
         "request_id": request_id,
@@ -78,6 +101,7 @@ def write_log(
 async def observe_request(request: Request, call_next):
     started = time.perf_counter()
     request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
+    request.state.request_id = request_id
 
     try:
         response = await call_next(request)
@@ -128,7 +152,7 @@ async def observe_request(request: Request, call_next):
 
 @app.get("/health")
 def health():
-    return {"status": "healthy"}
+    return {"status": "healthy", "cardinality_mode": CARDINALITY_MODE}
 
 
 @app.get("/bookings")
@@ -137,7 +161,7 @@ def list_bookings():
 
 
 @app.post("/bookings", status_code=201)
-def create_booking(booking: BookingRequest):
+def create_booking(booking: BookingRequest, request: Request):
     global create_request_number
 
     create_request_number += 1
@@ -161,6 +185,14 @@ def create_booking(booking: BookingRequest):
                 action="create",
                 result="rejected",
             ).inc()
+            write_log(
+                "WARNING",
+                "booking rejected because room is occupied",
+                request.state.request_id,
+                event_type="booking_rejected",
+                room=booking.room,
+                reason="room_occupied",
+            )
             raise HTTPException(
                 status_code=409,
                 detail="Room already has an active booking",
@@ -180,17 +212,35 @@ def create_booking(booking: BookingRequest):
     BOOKING_EVENTS.labels(action="create", result="success").inc()
     ACTIVE_BOOKINGS.inc()
 
+    write_log(
+        "INFO",
+        "booking created",
+        request.state.request_id,
+        event_type="booking_created",
+        booking_id=booking_id,
+        room=booking.room,
+        duration_minutes=booking.duration_minutes,
+    )
+
     return stored_booking
 
 
 @app.delete("/bookings/{booking_id}")
-def cancel_booking(booking_id: str):
+def cancel_booking(booking_id: str, request: Request):
     with booking_lock:
         if booking_id not in bookings:
             BOOKING_EVENTS.labels(
                 action="cancel",
                 result="rejected",
             ).inc()
+            write_log(
+                "WARNING",
+                "booking cancellation rejected",
+                request.state.request_id,
+                event_type="booking_cancel_rejected",
+                booking_id=booking_id,
+                reason="booking_not_found",
+            )
             raise HTTPException(status_code=404, detail="Booking not found")
 
         cancelled = bookings.pop(booking_id)
@@ -198,14 +248,62 @@ def cancel_booking(booking_id: str):
     BOOKING_EVENTS.labels(action="cancel", result="success").inc()
     ACTIVE_BOOKINGS.dec()
 
+    write_log(
+        "INFO",
+        "booking cancelled",
+        request.state.request_id,
+        event_type="booking_cancelled",
+        booking_id=booking_id,
+        room=cancelled["room"],
+    )
+
     return {"cancelled": cancelled}
 
 
 @app.post("/fault/slow")
-def configure_slow_fault(enabled: bool):
+def configure_slow_fault(enabled: bool, request: Request):
     global fault_enabled
     fault_enabled = enabled
+    write_log(
+        "WARNING" if enabled else "INFO",
+        "slow-request fault configuration changed",
+        request.state.request_id,
+        event_type="fault_configuration_changed",
+        slow_fault_enabled=enabled,
+    )
     return {"slow_fault_enabled": fault_enabled}
+
+
+@app.post("/demo/cardinality")
+def cardinality_demo(request_id: str, request: Request):
+    with cardinality_lock:
+        if request_id not in cardinality_request_ids:
+            if len(cardinality_request_ids) >= 100:
+                raise HTTPException(
+                    status_code=429,
+                    detail="Cardinality demo is capped at 100 unique IDs",
+                )
+            cardinality_request_ids.add(request_id)
+
+    if CARDINALITY_MODE == "unsafe":
+        CARDINALITY_DEMO.labels(request_id=request_id).inc()
+    else:
+        CARDINALITY_DEMO.inc()
+
+    write_log(
+        "INFO",
+        "cardinality demonstration request recorded",
+        request.state.request_id,
+        event_type="cardinality_demo",
+        cardinality_mode=CARDINALITY_MODE,
+        unique_ids=len(cardinality_request_ids),
+    )
+
+    return {
+        "mode": CARDINALITY_MODE,
+        "unique_ids": len(cardinality_request_ids),
+        "maximum_unique_ids": 100,
+    }
 
 
 @app.get("/metrics")
