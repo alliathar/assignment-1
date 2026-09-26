@@ -112,7 +112,7 @@ for this assignment.
 
 ```powershell
 $env:CARDINALITY_MODE = "unsafe"
-docker compose up -d --force-recreate room-booking-api
+docker compose up -d --force-recreate --wait room-booking-api
 python experiments\cardinality_test.py --count 100
 ```
 
@@ -130,7 +130,7 @@ count(demo_requests_total)
 
 ```powershell
 $env:CARDINALITY_MODE = "safe"
-docker compose up -d --force-recreate room-booking-api
+docker compose up -d --force-recreate --wait room-booking-api
 python experiments\cardinality_test.py --count 100
 ```
 
@@ -142,7 +142,7 @@ Return to the normal default environment:
 
 ```powershell
 Remove-Item Env:CARDINALITY_MODE -ErrorAction SilentlyContinue
-docker compose up -d --force-recreate room-booking-api
+docker compose up -d --force-recreate --wait room-booking-api
 ```
 
 Request IDs remain in JSON logs, where they can be searched without creating a
